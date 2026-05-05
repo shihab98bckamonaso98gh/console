@@ -1,3 +1,4 @@
+# app.py
 import os
 import logging
 import requests
@@ -12,14 +13,16 @@ EMAIL = os.environ.get("EMAIL", "")
 PASSWORD = os.environ.get("PASSWORD", "")
 BASE_URL = "https://stexsms.com/mapi/v1"
 MAX_LOGS = 100
-POLL_SECONDS = 5            # fetch data every 5 seconds
+POLL_SECONDS = 5                # base polling interval
+INFO_TIMEOUT = 15               # seconds (was 5, now more realistic)
+MAX_RETRIES = 2                 # retry on first timeout
+CONSECUTIVE_FAIL_THRESHOLD = 5  # after this many fails, back off
 # -----------------------------------
 
 app = Flask(__name__)
 logs_data = []
 seen_log_ids = set()
 
-# Basic logging (visible in Railway logs)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -62,43 +65,71 @@ def monitor_task():
     login()
 
     info_url = f"{BASE_URL}/mdashboard/console/info"
+    consecutive_fails = 0
+    backoff_time = POLL_SECONDS
 
     while True:
-        try:
-            resp = session.get(info_url, headers=headers, timeout=5)
-            if resp.status_code == 401:
-                logger.warning("Token expired – re-login")
-                login()
-                continue
+        success = False
+        for attempt in range(1 + MAX_RETRIES):
+            try:
+                resp = session.get(info_url, headers=headers, timeout=INFO_TIMEOUT)
+                if resp.status_code == 401:
+                    logger.warning("Token expired – re-login")
+                    login()
+                    continue
 
-            if resp.status_code == 200:
-                data = resp.json().get("data", {}).get("logs", [])
-                for item in reversed(data):
-                    log_id = str(item.get('id', ''))
-                    if log_id and log_id not in seen_log_ids:
-                        log_entry = {
-                            "id": log_id,
-                            "app": item.get('app_name', 'Unknown'),
-                            "number": item.get('number', 'N/A'),   # e.g., "261346929XXX"
-                            "range": str(item.get('range', 'N/A')),
-                            "country": item.get('country', 'N/A'),
-                            "message": item.get('sms', 'No Message'),
-                            "received_at": datetime.now().strftime("%H:%M:%S")
-                        }
-                        logs_data.insert(0, log_entry)
-                        seen_log_ids.add(log_id)
-                        if len(logs_data) > MAX_LOGS:
-                            logs_data.pop()
+                if resp.status_code == 200:
+                    data = resp.json().get("data", {}).get("logs", [])
+                    for item in reversed(data):
+                        log_id = str(item.get('id', ''))
+                        if log_id and log_id not in seen_log_ids:
+                            log_entry = {
+                                "id": log_id,
+                                "app": item.get('app_name', 'Unknown'),
+                                "number": item.get('number', 'N/A'),
+                                "range": str(item.get('range', 'N/A')),
+                                "country": item.get('country', 'N/A'),
+                                "message": item.get('sms', 'No Message'),
+                                "received_at": datetime.now().strftime("%H:%M:%S")
+                            }
+                            logs_data.insert(0, log_entry)
+                            seen_log_ids.add(log_id)
+                            if len(logs_data) > MAX_LOGS:
+                                logs_data.pop()
 
-                # Prevent memory bloat from seen IDs
-                if len(seen_log_ids) > 1000:
-                    seen_log_ids = set(list(seen_log_ids)[-500:])
+                    # Prevent memory bloat from seen IDs
+                    if len(seen_log_ids) > 1000:
+                        seen_log_ids = set(list(seen_log_ids)[-500:])
 
-            time.sleep(POLL_SECONDS)
+                    success = True
+                    break   # success, exit retry loop
 
-        except Exception as e:
-            logger.error(f"Polling error: {e}")
-            time.sleep(5)
+                else:
+                    logger.warning(f"Unexpected status {resp.status_code}")
+                    break   # don't retry on non-200 issues (except timeout)
+            except requests.exceptions.Timeout:
+                if attempt < MAX_RETRIES:
+                    logger.info(f"Timeout attempt {attempt+1}, retrying...")
+                    time.sleep(1)
+                else:
+                    logger.warning(f"Timeout after {MAX_RETRIES+1} attempts")
+            except Exception as e:
+                logger.error(f"Polling error: {e}")
+                break   # non-timeout exception, stop retrying
+
+        # Handle backoff for consecutive failures
+        if success:
+            consecutive_fails = 0
+            backoff_time = POLL_SECONDS
+        else:
+            consecutive_fails += 1
+            if consecutive_fails >= CONSECUTIVE_FAIL_THRESHOLD:
+                backoff_time = min(backoff_time * 2, 60)   # cap at 60s
+                logger.info(f"Too many consecutive failures, backing off to {backoff_time}s")
+            else:
+                backoff_time = POLL_SECONDS
+
+        time.sleep(backoff_time)
 
 
 # ---------- FRONTEND (auto‑refreshes every 5s) ----------
@@ -122,15 +153,8 @@ HTML_TEMPLATE = """
         .sms-text { color: #d63031; font-weight: bold; font-family: 'Courier New', monospace; font-size: 1rem; word-break: break-all; }
         .label { font-size: 0.65rem; color: #95a5a6; text-transform: uppercase; }
         .val { font-size: 0.8rem; color: #2d3436; font-weight: 600; }
-        .copy-number {
-            cursor: pointer;
-            transition: background-color 0.2s;
-            padding: 2px 4px;
-            border-radius: 4px;
-        }
-        .copy-number:hover {
-            background-color: #e9f2ff;
-        }
+        .copy-number { cursor: pointer; transition: background-color 0.2s; padding: 2px 4px; border-radius: 4px; }
+        .copy-number:hover { background-color: #e9f2ff; }
         #status { text-align: center; margin-top: 20px; color: #aaa; font-size: 0.8rem; }
     </style>
 </head>
@@ -141,11 +165,10 @@ HTML_TEMPLATE = """
         <div id="status"></div>
     </div>
     <script>
-        const REFRESH_MS = 5000;   // auto‑update every 5 seconds
+        const REFRESH_MS = 5000;
 
         function formatTime() {
-            const now = new Date();
-            return now.toLocaleTimeString();
+            return new Date().toLocaleTimeString();
         }
 
         async function loadLogs() {
@@ -188,40 +211,32 @@ HTML_TEMPLATE = """
             }
         }
 
-        // ---- Tap‑to‑copy for all number fields (event delegation) ----
         document.getElementById('logs').addEventListener('click', function(e) {
             const target = e.target.closest('.copy-number');
             if (!target) return;
-
             const text = target.innerText.trim();
             if (!text) return;
-
-            navigator.clipboard.writeText(text)
-                .then(() => {
-                    // Visual feedback
-                    const originalBg = target.style.backgroundColor;
-                    target.style.backgroundColor = '#d4edda';   // light green
-                    target.title = 'Copied!';
-                    setTimeout(() => {
-                        target.style.backgroundColor = originalBg;
-                        target.title = 'Click to copy';
-                    }, 800);
-                })
-                .catch(err => {
-                    console.error('Copy failed:', err);
-                    // Fallback for older browsers – show a prompt
-                    const tempInput = document.createElement('input');
-                    tempInput.value = text;
-                    document.body.appendChild(tempInput);
-                    tempInput.select();
-                    document.execCommand('copy');
-                    document.body.removeChild(tempInput);
-                    target.title = 'Copied!';
-                    setTimeout(() => { target.title = 'Click to copy'; }, 800);
-                });
+            navigator.clipboard.writeText(text).then(() => {
+                const orig = target.style.backgroundColor;
+                target.style.backgroundColor = '#d4edda';
+                target.title = 'Copied!';
+                setTimeout(() => {
+                    target.style.backgroundColor = orig;
+                    target.title = 'Click to copy';
+                }, 800);
+            }).catch(() => {
+                // fallback for older browsers
+                const inp = document.createElement('input');
+                inp.value = text;
+                document.body.appendChild(inp);
+                inp.select();
+                document.execCommand('copy');
+                document.body.removeChild(inp);
+                target.title = 'Copied!';
+                setTimeout(() => { target.title = 'Click to copy'; }, 800);
+            });
         });
 
-        // Initial load + periodic refresh
         loadLogs();
         setInterval(loadLogs, REFRESH_MS);
     </script>
@@ -239,7 +254,6 @@ def get_logs():
 
 if __name__ == "__main__":
     threading.Thread(target=monitor_task, daemon=True).start()
-
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 8080))
     logger.info(f"Starting server on port {port}")
     serve(app, host='0.0.0.0', port=port, threads=4)
