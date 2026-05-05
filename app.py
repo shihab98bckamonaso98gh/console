@@ -13,10 +13,10 @@ EMAIL = os.environ.get("EMAIL", "")
 PASSWORD = os.environ.get("PASSWORD", "")
 BASE_URL = "https://stexsms.com/mapi/v1"
 MAX_LOGS = 100
-POLL_SECONDS = 30                # start with a conservative interval
-INFO_TIMEOUT = 15                # read timeout per request
+POLL_SECONDS = 30                # base interval between successful polls
+INFO_TIMEOUT = 15                # read timeout
 MAX_RETRIES = 2                  # retries for timeouts only
-RATE_LIMIT_BACKOFF_BASE = 60     # seconds – increase when 429 hits
+RATE_LIMIT_BACKOFF_BASE = 60     # initial backoff on 429 (seconds)
 MAX_BACKOFF = 600                # never wait more than 10 minutes
 # -----------------------------------
 
@@ -75,13 +75,13 @@ def monitor_task():
             try:
                 resp = session.get(info_url, headers=headers, timeout=INFO_TIMEOUT)
 
-                # ---- Handle token expiry ----
+                # Token expired
                 if resp.status_code == 401:
                     logger.warning("Token expired – re-login")
                     login()
                     continue
 
-                # ---- Handle rate limiting (429) ----
+                # Rate limited – 429
                 if resp.status_code == 429:
                     retry_after = resp.headers.get("Retry-After")
                     if retry_after:
@@ -90,19 +90,15 @@ def monitor_task():
                         except ValueError:
                             wait = RATE_LIMIT_BACKOFF_BASE
                     else:
-                        # Exponential backoff: base * 2^(consecutive)
                         wait = min(RATE_LIMIT_BACKOFF_BASE * (2 ** consecutive_rate_limits), MAX_BACKOFF)
-                        # Add jitter: ±20%
-                        wait *= uniform(0.8, 1.2)
-                        wait = int(wait)
-
+                    # Add random jitter: ±20%
+                    wait = int(wait * uniform(0.8, 1.2))
                     logger.warning(f"Rate limited (429). Backing off for {wait}s")
                     time.sleep(wait)
                     consecutive_rate_limits += 1
-                    # After waiting, we will retry the request (continue outer loop)
-                    break   # exit retry attempt loop, then while will sleep leftover backoff
+                    break   # exit retry loop, then outer loop will also sleep backoff
 
-                # ---- Successful response ----
+                # Success
                 if resp.status_code == 200:
                     data = resp.json().get("data", {}).get("logs", [])
                     for item in reversed(data):
@@ -122,7 +118,6 @@ def monitor_task():
                             if len(logs_data) > MAX_LOGS:
                                 logs_data.pop()
 
-                    # Cleanup seen IDs set (keep size reasonable)
                     if len(seen_log_ids) > 1000:
                         seen_log_ids = set(list(seen_log_ids)[-500:])
 
@@ -130,9 +125,9 @@ def monitor_task():
                     backoff = POLL_SECONDS
                     consecutive_rate_limits = 0
                     success = True
-                    break   # success, exit retry loop
+                    break
 
-                # ---- Other unexpected status ----
+                # Any other status
                 logger.warning(f"Unexpected status {resp.status_code}")
                 break
 
@@ -142,30 +137,29 @@ def monitor_task():
                     time.sleep(1)
                 else:
                     logger.warning(f"Timeout after {MAX_RETRIES+1} attempts")
-                    # Increase backoff a little on repeated timeouts
+                    # Increase backoff after repeated timeouts
                     backoff = min(backoff * 1.5, MAX_BACKOFF)
             except Exception as e:
                 logger.error(f"Polling error: {e}")
                 break
 
-        # If 429 occurred, we already slept inside the handler and set backoff accordingly.
-        # For other failures, we'll use the current backoff value.
+        # Compute sleep before next poll
         if not success:
-            # If we got a 429, backoff already increased; for others, increase slightly
+            # If we got a 429, backoff already increased; for other failures, increase slightly
             if consecutive_rate_limits == 0:
                 backoff = min(backoff * 1.5, MAX_BACKOFF)
-            backoff += uniform(-2, 2)   # small jitter
+            # Add small jitter to avoid exact synchronisation
+            backoff += uniform(-2, 2)
             backoff = max(backoff, POLL_SECONDS)
             logger.info(f"Sleeping for {backoff:.0f}s before next poll")
         else:
-            # On success, just wait the base interval
             backoff = POLL_SECONDS + uniform(-2, 2)
             backoff = max(backoff, POLL_SECONDS)
 
         time.sleep(backoff)
 
 
-# ---------- FRONTEND (auto‑refreshes every 5s) ----------
+# ---------- FRONTEND (unchanged) ----------
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
