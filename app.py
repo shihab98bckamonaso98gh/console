@@ -1,4 +1,5 @@
 import os
+import logging
 import requests
 import threading
 import time
@@ -6,20 +7,30 @@ from datetime import datetime
 from flask import Flask, jsonify, render_template_string
 from waitress import serve
 
-# 🔐 Read credentials from environment variables – NEVER hardcode!
+# ---------- CONFIGURATION ----------
 EMAIL = os.environ.get("EMAIL", "")
 PASSWORD = os.environ.get("PASSWORD", "")
-
 BASE_URL = "https://stexsms.com/mapi/v1"
 MAX_LOGS = 100
+POLL_SECONDS = 5            # fetch data every 5 seconds
+# -----------------------------------
 
 app = Flask(__name__)
-
 logs_data = []
 seen_log_ids = set()
 
+# Basic logging setup (visible in Railway logs)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+logger = logging.getLogger(__name__)
+
 def monitor_task():
+    """Background thread: login to stexsms and continuously pull logs."""
     global logs_data, seen_log_ids
+
+    if not EMAIL or not PASSWORD:
+        logger.error("EMAIL and PASSWORD environment variables must be set!")
+        return
+
     session = requests.Session()
     headers = {
         "user-agent": "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36",
@@ -30,27 +41,36 @@ def monitor_task():
 
     def login():
         try:
-            login_url = f"{BASE_URL}/mauth/login"
-            payload = {"email": EMAIL, "password": PASSWORD}
-            response = session.post(login_url, json=payload, headers=headers, timeout=10)
-            if response.status_code == 200:
-                token = response.json().get("data", {}).get("token")
+            resp = session.post(
+                f"{BASE_URL}/mauth/login",
+                json={"email": EMAIL, "password": PASSWORD},
+                headers=headers,
+                timeout=10
+            )
+            if resp.status_code == 200:
+                token = resp.json().get("data", {}).get("token")
                 if token:
                     headers["mauthtoken"] = token
+                    logger.info("Login successful")
                     return True
-        except:
-            pass
+            logger.warning(f"Login failed. Status: {resp.status_code}")
+        except Exception as e:
+            logger.error(f"Login error: {e}")
         return False
 
+    # Initial login
     login()
+
     info_url = f"{BASE_URL}/mdashboard/console/info"
-    
+
     while True:
         try:
             resp = session.get(info_url, headers=headers, timeout=5)
             if resp.status_code == 401:
+                logger.warning("Token expired – re-login")
                 login()
                 continue
+
             if resp.status_code == 200:
                 data = resp.json().get("data", {}).get("logs", [])
                 for item in reversed(data):
@@ -69,17 +89,23 @@ def monitor_task():
                         seen_log_ids.add(log_id)
                         if len(logs_data) > MAX_LOGS:
                             logs_data.pop()
+
+                # Prevent memory bloat from seen IDs
                 if len(seen_log_ids) > 1000:
                     seen_log_ids = set(list(seen_log_ids)[-500:])
-            time.sleep(2)
-        except:
+
+            time.sleep(POLL_SECONDS)
+
+        except Exception as e:
+            logger.error(f"Polling error: {e}")
             time.sleep(5)
 
+# ---------- FRONTEND (auto‑refreshes every 5s) ----------
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>TSB Console Zone ( Live )</title>
+    <title>TSB Console Zone (Live)</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
         body { font-family: 'Segoe UI', sans-serif; background: #f0f2f5; margin: 0; padding: 10px; color: #333; }
@@ -95,23 +121,31 @@ HTML_TEMPLATE = """
         .sms-text { color: #d63031; font-weight: bold; font-family: 'Courier New', monospace; font-size: 1rem; word-break: break-all; }
         .label { font-size: 0.65rem; color: #95a5a6; text-transform: uppercase; }
         .val { font-size: 0.8rem; color: #2d3436; font-weight: 600; }
+        #status { text-align: center; margin-top: 20px; color: #aaa; font-size: 0.8rem; }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header"><h2>TSB Console Live</h2></div>
         <div id="logs"></div>
+        <div id="status"></div>
     </div>
     <script>
-        let lastCount = 0;
+        const REFRESH_MS = 5000;   // auto‑update every 5 seconds
+
+        function formatTime() {
+            const now = new Date();
+            return now.toLocaleTimeString();
+        }
+
         async function loadLogs() {
             try {
                 const res = await fetch('/api/logs');
                 const data = await res.json();
-                if(data.length === lastCount) return;
-                lastCount = data.length;
-                const div = document.getElementById('logs');
-                div.innerHTML = data.map(log => `
+                const container = document.getElementById('logs');
+                const status = document.getElementById('status');
+
+                container.innerHTML = data.map(log => `
                     <div class="card">
                         <div class="row">
                             <span class="app-name">${log.app}</span>
@@ -127,11 +161,17 @@ HTML_TEMPLATE = """
                             <div class="sms-text">${log.message}</div>
                         </div>
                     </div>
-                `).join('');
-            } catch (e) {}
+                `).join('') || '<p style="text-align:center;color:#aaa;">Waiting for SMS...</p>';
+
+                status.innerText = `Last update: ${formatTime()}`;
+            } catch(e) {
+                console.error('Load error:', e);
+            }
         }
-        setInterval(loadLogs, 2000);
+
+        // Initial load + periodic refresh
         loadLogs();
+        setInterval(loadLogs, REFRESH_MS);
     </script>
 </body>
 </html>
@@ -145,8 +185,12 @@ def home():
 def get_logs():
     return jsonify(logs_data)
 
+# ---------- MAIN ----------
 if __name__ == "__main__":
+    # Start background monitoring thread
     threading.Thread(target=monitor_task, daemon=True).start()
-    # 🚀 Use PORT from Railway environment (default 5000 for local testing)
+
+    # Use PORT from Railway environment (default 5000 for local runs)
     port = int(os.environ.get("PORT", 5000))
+    logger.info(f"Starting server on port {port}")
     serve(app, host='0.0.0.0', port=port, threads=4)
