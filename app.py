@@ -1,10 +1,10 @@
-# app.py
 import os
 import logging
 import requests
 import threading
 import time
 from datetime import datetime
+from random import uniform
 from flask import Flask, jsonify, render_template_string
 from waitress import serve
 
@@ -13,10 +13,11 @@ EMAIL = os.environ.get("EMAIL", "")
 PASSWORD = os.environ.get("PASSWORD", "")
 BASE_URL = "https://stexsms.com/mapi/v1"
 MAX_LOGS = 100
-POLL_SECONDS = 5                # base polling interval
-INFO_TIMEOUT = 15               # seconds (was 5, now more realistic)
-MAX_RETRIES = 2                 # retry on first timeout
-CONSECUTIVE_FAIL_THRESHOLD = 5  # after this many fails, back off
+POLL_SECONDS = 30                # start with a conservative interval
+INFO_TIMEOUT = 15                # read timeout per request
+MAX_RETRIES = 2                  # retries for timeouts only
+RATE_LIMIT_BACKOFF_BASE = 60     # seconds – increase when 429 hits
+MAX_BACKOFF = 600                # never wait more than 10 minutes
 # -----------------------------------
 
 app = Flask(__name__)
@@ -25,6 +26,7 @@ seen_log_ids = set()
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
+
 
 def monitor_task():
     """Background thread: login to stexsms and continuously pull logs."""
@@ -61,23 +63,46 @@ def monitor_task():
             logger.error(f"Login error: {e}")
         return False
 
-    # Initial login
     login()
-
     info_url = f"{BASE_URL}/mdashboard/console/info"
-    consecutive_fails = 0
-    backoff_time = POLL_SECONDS
+
+    backoff = POLL_SECONDS
+    consecutive_rate_limits = 0
 
     while True:
         success = False
         for attempt in range(1 + MAX_RETRIES):
             try:
                 resp = session.get(info_url, headers=headers, timeout=INFO_TIMEOUT)
+
+                # ---- Handle token expiry ----
                 if resp.status_code == 401:
                     logger.warning("Token expired – re-login")
                     login()
                     continue
 
+                # ---- Handle rate limiting (429) ----
+                if resp.status_code == 429:
+                    retry_after = resp.headers.get("Retry-After")
+                    if retry_after:
+                        try:
+                            wait = int(retry_after)
+                        except ValueError:
+                            wait = RATE_LIMIT_BACKOFF_BASE
+                    else:
+                        # Exponential backoff: base * 2^(consecutive)
+                        wait = min(RATE_LIMIT_BACKOFF_BASE * (2 ** consecutive_rate_limits), MAX_BACKOFF)
+                        # Add jitter: ±20%
+                        wait *= uniform(0.8, 1.2)
+                        wait = int(wait)
+
+                    logger.warning(f"Rate limited (429). Backing off for {wait}s")
+                    time.sleep(wait)
+                    consecutive_rate_limits += 1
+                    # After waiting, we will retry the request (continue outer loop)
+                    break   # exit retry attempt loop, then while will sleep leftover backoff
+
+                # ---- Successful response ----
                 if resp.status_code == 200:
                     data = resp.json().get("data", {}).get("logs", [])
                     for item in reversed(data):
@@ -97,39 +122,47 @@ def monitor_task():
                             if len(logs_data) > MAX_LOGS:
                                 logs_data.pop()
 
-                    # Prevent memory bloat from seen IDs
+                    # Cleanup seen IDs set (keep size reasonable)
                     if len(seen_log_ids) > 1000:
                         seen_log_ids = set(list(seen_log_ids)[-500:])
 
+                    # Reset backoff on success
+                    backoff = POLL_SECONDS
+                    consecutive_rate_limits = 0
                     success = True
                     break   # success, exit retry loop
 
-                else:
-                    logger.warning(f"Unexpected status {resp.status_code}")
-                    break   # don't retry on non-200 issues (except timeout)
+                # ---- Other unexpected status ----
+                logger.warning(f"Unexpected status {resp.status_code}")
+                break
+
             except requests.exceptions.Timeout:
                 if attempt < MAX_RETRIES:
                     logger.info(f"Timeout attempt {attempt+1}, retrying...")
                     time.sleep(1)
                 else:
                     logger.warning(f"Timeout after {MAX_RETRIES+1} attempts")
+                    # Increase backoff a little on repeated timeouts
+                    backoff = min(backoff * 1.5, MAX_BACKOFF)
             except Exception as e:
                 logger.error(f"Polling error: {e}")
-                break   # non-timeout exception, stop retrying
+                break
 
-        # Handle backoff for consecutive failures
-        if success:
-            consecutive_fails = 0
-            backoff_time = POLL_SECONDS
+        # If 429 occurred, we already slept inside the handler and set backoff accordingly.
+        # For other failures, we'll use the current backoff value.
+        if not success:
+            # If we got a 429, backoff already increased; for others, increase slightly
+            if consecutive_rate_limits == 0:
+                backoff = min(backoff * 1.5, MAX_BACKOFF)
+            backoff += uniform(-2, 2)   # small jitter
+            backoff = max(backoff, POLL_SECONDS)
+            logger.info(f"Sleeping for {backoff:.0f}s before next poll")
         else:
-            consecutive_fails += 1
-            if consecutive_fails >= CONSECUTIVE_FAIL_THRESHOLD:
-                backoff_time = min(backoff_time * 2, 60)   # cap at 60s
-                logger.info(f"Too many consecutive failures, backing off to {backoff_time}s")
-            else:
-                backoff_time = POLL_SECONDS
+            # On success, just wait the base interval
+            backoff = POLL_SECONDS + uniform(-2, 2)
+            backoff = max(backoff, POLL_SECONDS)
 
-        time.sleep(backoff_time)
+        time.sleep(backoff)
 
 
 # ---------- FRONTEND (auto‑refreshes every 5s) ----------
@@ -225,7 +258,6 @@ HTML_TEMPLATE = """
                     target.title = 'Click to copy';
                 }, 800);
             }).catch(() => {
-                // fallback for older browsers
                 const inp = document.createElement('input');
                 inp.value = text;
                 document.body.appendChild(inp);
@@ -244,6 +276,7 @@ HTML_TEMPLATE = """
 </html>
 """
 
+
 @app.route('/')
 def home():
     return render_template_string(HTML_TEMPLATE)
@@ -251,6 +284,7 @@ def home():
 @app.route('/api/logs')
 def get_logs():
     return jsonify(logs_data)
+
 
 if __name__ == "__main__":
     threading.Thread(target=monitor_task, daemon=True).start()
