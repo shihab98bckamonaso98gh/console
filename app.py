@@ -19,7 +19,7 @@ app = Flask(__name__)
 logs_data = []
 seen_log_ids = set()
 
-# Basic logging setup (visible in Railway logs)
+# Basic logging (visible in Railway logs)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -79,7 +79,7 @@ def monitor_task():
                         log_entry = {
                             "id": log_id,
                             "app": item.get('app_name', 'Unknown'),
-                            "number": item.get('number', 'N/A'),
+                            "number": item.get('number', 'N/A'),   # e.g., "261346929XXX"
                             "range": str(item.get('range', 'N/A')),
                             "country": item.get('country', 'N/A'),
                             "message": item.get('sms', 'No Message'),
@@ -99,6 +99,7 @@ def monitor_task():
         except Exception as e:
             logger.error(f"Polling error: {e}")
             time.sleep(5)
+
 
 # ---------- FRONTEND (auto‑refreshes every 5s) ----------
 HTML_TEMPLATE = """
@@ -121,6 +122,15 @@ HTML_TEMPLATE = """
         .sms-text { color: #d63031; font-weight: bold; font-family: 'Courier New', monospace; font-size: 1rem; word-break: break-all; }
         .label { font-size: 0.65rem; color: #95a5a6; text-transform: uppercase; }
         .val { font-size: 0.8rem; color: #2d3436; font-weight: 600; }
+        .copy-number {
+            cursor: pointer;
+            transition: background-color 0.2s;
+            padding: 2px 4px;
+            border-radius: 4px;
+        }
+        .copy-number:hover {
+            background-color: #e9f2ff;
+        }
         #status { text-align: center; margin-top: 20px; color: #aaa; font-size: 0.8rem; }
     </style>
 </head>
@@ -152,9 +162,18 @@ HTML_TEMPLATE = """
                             <span class="sync-time">${log.received_at}</span>
                         </div>
                         <div class="data-grid">
-                            <div><div class="label">Number</div><div class="val">${log.number}</div></div>
-                            <div><div class="label">Range</div><div class="val">${log.range}</div></div>
-                            <div><div class="label">Country</div><div class="val">${log.country}</div></div>
+                            <div>
+                                <div class="label">Number</div>
+                                <div class="val copy-number" title="Click to copy">${log.number}</div>
+                            </div>
+                            <div>
+                                <div class="label">Range</div>
+                                <div class="val">${log.range}</div>
+                            </div>
+                            <div>
+                                <div class="label">Country</div>
+                                <div class="val">${log.country}</div>
+                            </div>
                         </div>
                         <div class="sms-box">
                             <div class="label">OTP / SMS Content</div>
@@ -168,6 +187,39 @@ HTML_TEMPLATE = """
                 console.error('Load error:', e);
             }
         }
+
+        // ---- Tap‑to‑copy for all number fields (event delegation) ----
+        document.getElementById('logs').addEventListener('click', function(e) {
+            const target = e.target.closest('.copy-number');
+            if (!target) return;
+
+            const text = target.innerText.trim();
+            if (!text) return;
+
+            navigator.clipboard.writeText(text)
+                .then(() => {
+                    // Visual feedback
+                    const originalBg = target.style.backgroundColor;
+                    target.style.backgroundColor = '#d4edda';   // light green
+                    target.title = 'Copied!';
+                    setTimeout(() => {
+                        target.style.backgroundColor = originalBg;
+                        target.title = 'Click to copy';
+                    }, 800);
+                })
+                .catch(err => {
+                    console.error('Copy failed:', err);
+                    // Fallback for older browsers – show a prompt
+                    const tempInput = document.createElement('input');
+                    tempInput.value = text;
+                    document.body.appendChild(tempInput);
+                    tempInput.select();
+                    document.execCommand('copy');
+                    document.body.removeChild(tempInput);
+                    target.title = 'Copied!';
+                    setTimeout(() => { target.title = 'Click to copy'; }, 800);
+                });
+        });
 
         // Initial load + periodic refresh
         loadLogs();
@@ -185,12 +237,9 @@ def home():
 def get_logs():
     return jsonify(logs_data)
 
-# ---------- MAIN ----------
 if __name__ == "__main__":
-    # Start background monitoring thread
     threading.Thread(target=monitor_task, daemon=True).start()
 
-    # Use PORT from Railway environment (default 5000 for local runs)
     port = int(os.environ.get("PORT", 5000))
     logger.info(f"Starting server on port {port}")
     serve(app, host='0.0.0.0', port=port, threads=4)
